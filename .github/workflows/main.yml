@@ -1,0 +1,826 @@
+name: Build Full Android ARM64 Toolchain (NDK r30)
+
+# Allows triggering the workflow manually from the GitHub Actions tab
+# by selecting the target minimum Android API level.
+on:
+  workflow_dispatch:
+    inputs:
+      android_api:
+        description: Android minimum API level
+        required: true
+        default: '34'
+        type: choice
+        options: ['34', '35', '36', '37']
+
+# Grants write access to repository contents so the workflow can create
+# and replace GitHub Releases and their associated tags.
+permissions:
+  contents: write
+
+# Cancels earlier runs on the same branch to avoid redundant builds
+# and save compute minutes on shared runners.
+concurrency:
+  group: full-toolchain-android-arm64-r30-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Android ARM64 LLVM 23.1.6 Toolchain (NDK r30, API ${{ inputs.android_api }})
+    runs-on: ubuntu-24.04
+    # 6-hour upper limit: a full cross-compilation of LLVM/Clang/LLD/LLDB
+    # can approach several hours depending on runner load.
+    timeout-minutes: 360
+
+    env:
+      LLVM_TAG: llvmorg-23.1.6
+      NDK_VERSION: 30.0.16248370
+      NDK_SHA1: 5107f898313790e449e87eee2183d9a20602dee9
+      ANDROID_API: ${{ inputs.android_api }}
+      PREFIX: ${{ github.workspace }}/finalpackage_arm64
+      NDK_HOME: ${{ github.workspace }}/android-ndk-r30
+      NDK_HOST: linux-x86_64
+      BUILD_ROOT: ${{ github.workspace }}/build
+
+    steps:
+      # Frees disk space by removing large preinstalled packages
+      # not required to build the toolchain.
+      - name: Free disk space
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h
+          for dir in \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/share/boost \
+            /usr/local/share/powershell; do
+            if [[ -d "$dir" ]]; then
+              sudo rm -rf "$dir"
+            fi
+          done
+          df -h
+
+      # Provisions 6 GB of swap to mitigate out-of-memory (OOM) failures
+      # during linking and compilation of heavy LLVM targets.
+      - name: Configure swap
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo swapoff -a || true
+          sudo rm -f /swapfile
+          sudo fallocate -l 6G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=6144
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
+      # Installs minimal host system dependencies (without recommended packages).
+      - name: Install host build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build git wget unzip python3 \
+            pkg-config ca-certificates file binutils xz-utils \
+            zlib1g-dev libzstd-dev liblzma-dev ccache
+
+      # Restores and saves the ccache cache across runs.
+      - name: Cache ccache
+        uses: actions/cache@v5
+        with:
+          path: ~/.ccache
+          key: ${{ runner.os }}-ccache-${{ env.LLVM_TAG }}-api-${{ inputs.android_api }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-${{ env.LLVM_TAG }}-api-${{ inputs.android_api }}-
+            ${{ runner.os }}-ccache-${{ env.LLVM_TAG }}-
+
+      # Caches NDK r30 by version and SHA-1 checksum to reduce download times.
+      - name: Cache Android NDK r30
+        id: ndk-cache
+        uses: actions/cache@v5
+        with:
+          path: android-ndk-r30
+          key: ${{ runner.os }}-android-ndk-${{ env.NDK_VERSION }}-${{ env.NDK_SHA1 }}
+
+      # Downloads the official NDK on a cache miss and validates its SHA-1 hash before extracting.
+      - name: Download and verify Android NDK r30
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          wget -q --show-progress \
+            https://dl.google.com/android/repository/android-ndk-r30-linux.zip \
+            -O android-ndk-r30-linux.zip
+          echo "${NDK_SHA1}  android-ndk-r30-linux.zip" | sha1sum -c -
+          unzip -q android-ndk-r30-linux.zip
+          rm -f android-ndk-r30-linux.zip
+
+      # Verifies that the NDK host toolchain is executable (both on cache hit and miss).
+      - name: Verify Android NDK r30 installation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x "${NDK_HOME}/toolchains/llvm/prebuilt/${NDK_HOST}/bin/clang"
+
+      # Creates the destination directory structure and exports parallelism based on available cores.
+      - name: Prepare directories and enable all available CPU workers
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p \
+            "${BUILD_ROOT}" \
+            "${PREFIX}/bin" \
+            "${PREFIX}/include" \
+            "${PREFIX}/lib" \
+            "${PREFIX}/sysroot/usr/include" \
+            "${PREFIX}/sysroot/usr/lib" \
+            "${PREFIX}/sysroot/lib"
+
+          # Uses all logical cores detected by nproc to maximize throughput.
+          BUILD_JOBS="$(nproc)"
+          test "${BUILD_JOBS}" -ge 1
+
+          {
+            echo "BUILD_JOBS=${BUILD_JOBS}"
+            echo "CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS}"
+            echo "NDK_HOME=${NDK_HOME}"
+            echo "ANDROID_NDK_HOME=${NDK_HOME}"
+            echo "PREFIX=${PREFIX}"
+            echo "BUILD_ROOT=${BUILD_ROOT}"
+          } >> "${GITHUB_ENV}"
+
+          echo "=============================================="
+          echo "Available CPU workers: ${BUILD_JOBS}"
+          echo "LLVM compile/link job caps: not set"
+          echo "=============================================="
+          nproc
+          lscpu || true
+
+      # Performs a shallow clone (--depth 1) of the exact LLVM tag to save time and disk space.
+      - name: Clone LLVM 23.1.6
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${LLVM_TAG}" \
+            https://github.com/llvm/llvm-project.git llvm-project
+          git -C llvm-project rev-parse HEAD
+
+      # Stage 1 (host x86_64): builds only the native TableGen tools
+      # needed for code generation during cross-compilation.
+      - name: Build native TableGen tools for the Ubuntu host
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ccache --max-size=7G
+          ccache --zero-stats
+
+          cmake -S llvm-project/llvm -B "${BUILD_ROOT}/host" -G Ninja \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${BUILD_ROOT}/host-install" \
+            -DLLVM_ENABLE_PROJECTS='clang;clang-tools-extra;lld;lldb' \
+            -DLLVM_TARGETS_TO_BUILD=X86 \
+            -DLLVM_BUILD_TOOLS=ON \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_DOCS=OFF \
+            -DLLDB_INCLUDE_TESTS=OFF \
+            -DLLDB_ENABLE_PYTHON=OFF \
+            -DLLDB_ENABLE_LIBEDIT=OFF \
+            -DLLDB_ENABLE_CURSES=OFF \
+            -DLLDB_ENABLE_LIBXML2=OFF \
+            -DLLDB_ENABLE_LUA=OFF \
+            -DLLVM_ENABLE_ZLIB=ON \
+            -DLLVM_ENABLE_ZSTD=OFF \
+            -DLLVM_ENABLE_LIBXML2=OFF \
+            -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_ENABLE_LIBEDIT=OFF \
+            -DLLVM_ENABLE_FFI=OFF
+
+          cmake --build "${BUILD_ROOT}/host" \
+            --target llvm-tblgen clang-tblgen lldb-tblgen \
+            --parallel "${BUILD_JOBS}"
+
+          for tool in llvm-tblgen clang-tblgen lldb-tblgen; do
+            test -x "${BUILD_ROOT}/host/bin/${tool}"
+          done
+
+      # Stage 2 (target arm64-v8a): cross-compiles LLVM, Clang, clang-repl, clangd, LLD, and lldb-server
+      # prioritizing smaller binary size (MinSizeRel) and shared libraries.
+      - name: Cross-build LLVM, Clang, clang-repl, clangd, LLD and LLDB Server for Android ARM64
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TOOLCHAIN_FILE="${NDK_HOME}/build/cmake/android.toolchain.cmake"
+          NATIVE_TOOLS="${BUILD_ROOT}/host/bin"
+          TARGET_RPATH='$ORIGIN/../lib'
+
+          cmake -S llvm-project/llvm -B "${BUILD_ROOT}/android-llvm" -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="${TOOLCHAIN_FILE}" \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM="android-${ANDROID_API}" \
+            -DANDROID_STL=c++_shared \
+            -DANDROID_ALLOW_UNDEFINED_SYMBOLS=ON \
+            -DCMAKE_BUILD_TYPE=MinSizeRel \
+            -DCMAKE_INSTALL_PREFIX="${PREFIX}" \
+            -DCMAKE_INSTALL_BINDIR=bin \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DCMAKE_INSTALL_INCLUDEDIR=include \
+            -DCMAKE_INSTALL_RPATH="${TARGET_RPATH}" \
+            -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF \
+            -DLLVM_ENABLE_PROJECTS='clang;clang-tools-extra;lld;lldb' \
+            -DLLVM_TARGETS_TO_BUILD=AArch64 \
+            -DLLVM_HOST_TRIPLE=aarch64-unknown-linux-android \
+            -DLLVM_DEFAULT_TARGET_TRIPLE="aarch64-linux-android${ANDROID_API}" \
+            -DLLVM_NATIVE_TOOL_DIR="${NATIVE_TOOLS}" \
+            -DLLVM_BUILD_TOOLS=ON \
+            -DCLANG_BUILD_TOOLS=ON \
+            -DLLVM_INSTALL_UTILS=OFF \
+            -DLLVM_BUILD_LLVM_DYLIB=ON \
+            -DLLVM_LINK_LLVM_DYLIB=ON \
+            -DCLANG_LINK_CLANG_DYLIB=ON \
+            -DLLVM_ENABLE_PIC=ON \
+            -DLLVM_ENABLE_RTTI=ON \
+            -DLLVM_ENABLE_EH=ON \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_DOCS=OFF \
+            -DCLANG_INCLUDE_TESTS=OFF \
+            -DCLANG_BUILD_EXAMPLES=OFF \
+            -DCLANG_ENABLE_STATIC_ANALYZER=OFF \
+            -DCLANG_TOOLS_EXTRA_INCLUDE_TESTS=OFF \
+            -DLLDB_INCLUDE_TESTS=OFF \
+            -DLLDB_ENABLE_PYTHON=OFF \
+            -DLLDB_ENABLE_LIBEDIT=OFF \
+            -DLLDB_ENABLE_CURSES=OFF \
+            -DLLDB_ENABLE_LIBXML2=OFF \
+            -DLLDB_ENABLE_LUA=OFF \
+            -DLLVM_ENABLE_ZLIB=ON \
+            -DLLVM_ENABLE_ZSTD=OFF \
+            -DLLVM_ENABLE_LIBXML2=OFF \
+            -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_ENABLE_LIBEDIT=OFF \
+            -DLLVM_ENABLE_FFI=OFF
+
+          cmake --build "${BUILD_ROOT}/android-llvm" \
+            --parallel "${BUILD_JOBS}"
+          cmake --install "${BUILD_ROOT}/android-llvm"
+
+          ccache --show-stats
+
+      # Copies NDK headers, libraries, and compiler-rt for AArch64, pruning API levels
+      # below 34 (retaining API 34 and higher) and directories for other architectures.
+      - name: Assemble and prune the NDK r30 Android ARM64 sysroot
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          NDK_SYSROOT="${NDK_HOME}/toolchains/llvm/prebuilt/${NDK_HOST}/sysroot"
+          NDK_TARGET_LIB="${NDK_SYSROOT}/usr/lib/aarch64-linux-android"
+          PACKAGE_TARGET_LIB="${PREFIX}/sysroot/usr/lib/aarch64-linux-android"
+
+          test -d "${NDK_SYSROOT}/usr/include"
+          test -d "${NDK_TARGET_LIB}/${ANDROID_API}"
+
+          cp -a "${NDK_SYSROOT}/usr/include/." \
+            "${PREFIX}/sysroot/usr/include/"
+          mkdir -p "${PACKAGE_TARGET_LIB}"
+          cp -a "${NDK_TARGET_LIB}/." "${PACKAGE_TARGET_LIB}/"
+
+          # 1. Removes numeric directories for API levels below 34.
+          while IFS= read -r -d '' dir; do
+            base="${dir##*/}"
+            if [[ "${base}" =~ ^[0-9]+$ ]] && (( base < 34 )); then
+              rm -rf "${dir}"
+            fi
+          done < <(find "${PACKAGE_TARGET_LIB}" -mindepth 1 -maxdepth 1 -type d -print0)
+
+          # 2. Removes subdirectories for other ABIs in sysroot/usr/lib while preserving aarch64/arm64.
+          while IFS= read -r -d '' dir; do
+            rm -rf "${dir}"
+          done < <(
+            find "${PREFIX}/sysroot/usr/lib" -mindepth 1 -maxdepth 2 -type d \
+              \( -name 'arm' -o -name 'i386' -o -name '386' -o -name 'x86' -o -name 'mips' -o -name 'riscv' \) \
+              ! -name 'aarch64' ! -name 'arm64' \
+              -print0
+          )
+
+          # 3. Inspects and removes top-level folders for other ABIs in sysroot/usr/include
+          #    without affecting shared paths.
+          echo "--- Inspecting sysroot/usr/include top-level ABI-like directories ---"
+          find "${PREFIX}/sysroot/usr/include" -mindepth 1 -maxdepth 1 -type d \
+            \( -name 'arm' -o -name 'i386' -o -name '386' -o -name 'x86' -o -name 'mips' -o -name 'riscv' \) \
+            ! -name 'aarch64' ! -name 'arm64' \
+            -print || true
+
+          while IFS= read -r -d '' dir; do
+            rm -rf "${dir}"
+          done < <(
+            find "${PREFIX}/sysroot/usr/include" -mindepth 1 -maxdepth 1 -type d \
+              \( -name 'arm' -o -name 'i386' -o -name '386' -o -name 'x86' -o -name 'mips' -o -name 'riscv' \) \
+              ! -name 'aarch64' ! -name 'arm64' \
+              -print0
+          )
+
+          # Exposes shared C++ runtimes under lib/ to simplify dynamic loading on mobile environments.
+          for runtime in libc++_shared.so libbackcompat_shared.so; do
+            if [[ -e "${PACKAGE_TARGET_LIB}/${runtime}" ]]; then
+              ln -sfn "../sysroot/usr/lib/aarch64-linux-android/${runtime}" \
+                "${PREFIX}/lib/${runtime}"
+            fi
+          done
+
+          # Installs the static compiler-rt builtins library for AArch64 in the path expected by Clang 23.
+          BUILTINS="$(find \
+            "${NDK_HOME}/toolchains/llvm/prebuilt/${NDK_HOST}/lib/clang" \
+            -type f \
+            -name 'libclang_rt.builtins-aarch64-android.a' \
+            -print -quit)"
+          test -n "${BUILTINS}"
+
+          mkdir -p "${PREFIX}/lib/clang/23/lib/linux"
+          install -m 0644 "${BUILTINS}" \
+            "${PREFIX}/lib/clang/23/lib/linux/libclang_rt.builtins-aarch64-android.a"
+
+      # Verifies C and C++23 compilation and linking with the packaged sysroot and validates the resulting ELF architecture.
+      - name: Check C and C++23 compilation and linking with the packaged compiler
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          NDK_TC="${NDK_HOME}/toolchains/llvm/prebuilt/${NDK_HOST}"
+          READELF="${NDK_TC}/bin/llvm-readelf"
+          FAILED_TESTS=()
+
+          run_check() {
+            local label="$1"
+            shift
+            echo "=== [TEST] ${label} ==="
+            if "$@"; then
+              echo "PASS: ${label}"
+            else
+              local rc=$?
+              echo "::error::FAIL (${rc}): ${label}"
+              FAILED_TESTS+=("${label}")
+            fi
+          }
+
+          cat > "${BUILD_ROOT}/c-smoke.c" <<'C'
+          #include <stdbool.h>
+          #include <stdio.h>
+
+          int main(void) {
+            bool ok = true;
+            fputs("c-smoke\n", stderr);
+            return ok ? 0 : 1;
+          }
+          C
+
+          run_check "C23 syntax-only" \
+            "${NDK_TC}/bin/clang" \
+            --target="aarch64-linux-android${ANDROID_API}" \
+            --sysroot="${PREFIX}/sysroot" \
+            -std=c23 \
+            -fsyntax-only \
+            "${BUILD_ROOT}/c-smoke.c"
+
+          run_check "C23 compile and link" \
+            "${NDK_TC}/bin/clang" \
+            --target="aarch64-linux-android${ANDROID_API}" \
+            --sysroot="${PREFIX}/sysroot" \
+            -B"${NDK_TC}/bin" \
+            -std=c23 \
+            -fuse-ld=lld \
+            "${BUILD_ROOT}/c-smoke.c" \
+            -o "${BUILD_ROOT}/c-smoke-android"
+
+          run_check "C23 ELF AArch64 check" \
+            bash -c '
+              if [[ ! -f "$2" ]]; then
+                echo "Binary not generated: $2"
+                exit 1
+              fi
+              HEADER="$("$1" -h "$2" 2>&1)"
+              echo "${HEADER}" | grep -q "Machine:.*AArch64" || {
+                echo "${HEADER}"
+                exit 1
+              }
+            ' _ "${READELF}" "${BUILD_ROOT}/c-smoke-android"
+
+          cat > "${BUILD_ROOT}/cxx23-smoke.cpp" <<'CPP'
+          #include <expected>
+          #include <flat_map>
+          #include <print>
+          #include <span>
+          #include <string>
+
+          consteval int compile_time_value() { return 23; }
+          static_assert(compile_time_value() == 23);
+
+          int main() {
+            std::expected<long, std::string> value{23};
+            int data[] = {1, 2, 3};
+            std::span<int> view(data);
+            std::flat_map<int, int> pairs;
+            pairs.emplace(1, 10);
+            pairs.emplace(2, 20);
+            std::print(stderr, "smoke: {}\n", pairs.at(2));
+            return static_cast<int>(value.value() + view.size() + pairs.size());
+          }
+          CPP
+
+          run_check "C++23 syntax-only (headers: expected, flat_map, print, span)" \
+            "${NDK_TC}/bin/clang++" \
+            --target="aarch64-linux-android${ANDROID_API}" \
+            --sysroot="${PREFIX}/sysroot" \
+            -stdlib=libc++ \
+            -std=c++23 \
+            -fsyntax-only \
+            "${BUILD_ROOT}/cxx23-smoke.cpp"
+
+          run_check "C++23 compile and link" \
+            "${NDK_TC}/bin/clang++" \
+            --target="aarch64-linux-android${ANDROID_API}" \
+            --sysroot="${PREFIX}/sysroot" \
+            -B"${NDK_TC}/bin" \
+            -stdlib=libc++ \
+            -std=c++23 \
+            -fuse-ld=lld \
+            "${BUILD_ROOT}/cxx23-smoke.cpp" \
+            -o "${BUILD_ROOT}/cxx23-smoke-android"
+
+          run_check "C++23 ELF AArch64 check" \
+            bash -c '
+              if [[ ! -f "$2" ]]; then
+                echo "Binary not generated: $2"
+                exit 1
+              fi
+              HEADER="$("$1" -h "$2" 2>&1)"
+              echo "${HEADER}" | grep -q "Machine:.*AArch64" || {
+                echo "${HEADER}"
+                exit 1
+              }
+            ' _ "${READELF}" "${BUILD_ROOT}/cxx23-smoke-android"
+
+          rm -f \
+            "${BUILD_ROOT}/c-smoke.c" \
+            "${BUILD_ROOT}/c-smoke-android" \
+            "${BUILD_ROOT}/cxx23-smoke.cpp" \
+            "${BUILD_ROOT}/cxx23-smoke-android"
+
+          if (( ${#FAILED_TESTS[@]} > 0 )); then
+            echo "=============================================="
+            echo "Failed checks (${#FAILED_TESTS[@]}):"
+            printf ' - %s\n' "${FAILED_TESTS[@]}"
+            echo "=============================================="
+            exit 1
+          fi
+
+      # Normalizes names/aliases, removes extraneous executables/resources, and strips unneeded symbols.
+      - name: Create compatibility names, strip ELF binaries, and prune nonessential files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          LLVM_STRIP="${NDK_HOME}/toolchains/llvm/prebuilt/${NDK_HOST}/bin/llvm-strip"
+
+          if [[ -x "${PREFIX}/bin/clang" && ! -e "${PREFIX}/bin/clang-23" ]]; then
+            mv "${PREFIX}/bin/clang" "${PREFIX}/bin/clang-23"
+          fi
+          test -x "${PREFIX}/bin/clang-23"
+
+          # Minimal set of tools required to compile, analyze, and debug on AArch64.
+          KEEP_BINS=(
+            clang-23
+            clang-repl
+            clangd
+            clang-format
+            clang-tidy
+            clang-scan-deps
+            ld.lld
+            lld
+            lldb-server
+            llvm-ar
+            llvm-ranlib
+            llvm-strip
+            llvm-nm
+            llvm-objcopy
+            llvm-objdump
+            llvm-readelf
+            llvm-symbolizer
+            llvm-addr2line
+          )
+
+          # Creates symlinks for common aliases and includes them in the allowlist.
+          create_alias() {
+            local target="$1"
+            local link_name="$2"
+            if [[ -e "${PREFIX}/bin/${target}" ]]; then
+              ln -sfn "${target}" "${PREFIX}/bin/${link_name}"
+              KEEP_BINS+=("${link_name}")
+            fi
+          }
+
+          create_alias clang-23 clang
+          create_alias clang-23 clang++
+          create_alias llvm-ar ar
+          create_alias llvm-ranlib ranlib
+          create_alias llvm-strip strip
+          create_alias ld.lld ld
+
+          # Builds a hash set for fast filtering of allowed binaries in bin/.
+          declare -A KEEP_MAP
+          for bin in "${KEEP_BINS[@]}"; do
+            KEEP_MAP["${bin}"]=1
+          done
+
+          # Purges any binary or link in bin/ that is not explicitly allowed before stripping.
+          while IFS= read -r -d '' item; do
+            name="${item##*/}"
+            if [[ -z "${KEEP_MAP[${name}]:-}" ]]; then
+              rm -f "${item}"
+            fi
+          done < <(
+            find "${PREFIX}/bin" -mindepth 1 -maxdepth 1 \
+              \( -type f -o -type l \) -print0
+          )
+
+          # Removes any residual share directory installed by CMake subprojects.
+          rm -rf "${PREFIX}/share"
+
+          # Strips unnecessary symbols (--strip-unneeded) from retained ELF binaries and libraries.
+          while IFS= read -r -d '' file_path; do
+            if [[ ! -L "${file_path}" ]] && file -b "${file_path}" | grep -q '^ELF'; then
+              "${LLVM_STRIP}" --strip-unneeded "${file_path}"
+            fi
+          done < <(
+            find "${PREFIX}/bin" "${PREFIX}/lib" -type f \
+              \( -perm -0100 -o -name '*.so' -o -name '*.so.*' \) \
+              -print0
+          )
+
+      # Generates the TOOLCHAIN-INFO.txt manifest with build metadata, example commands, and usage notes.
+      - name: Create toolchain information file
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "${PREFIX}/TOOLCHAIN-INFO.txt" <<EOF
+          Android ARM64 embedded toolchain
+          =================================
+          LLVM: ${LLVM_TAG}
+          Android NDK: ${NDK_VERSION}
+          Android API: ${ANDROID_API}
+          ABI: arm64-v8a
+          Target triple: aarch64-linux-android${ANDROID_API}
+          C++ standard library: NDK libc++
+          Sysroot pruning: API levels < 34 removed (retains API 34+); non-aarch64/arm64 ABI paths removed
+
+          Compiler:
+          bin/clang
+          bin/clang++
+          bin/clangd
+
+          Interactive C++ REPL:
+          bin/clang-repl
+
+          Linker:
+          bin/ld.lld
+          bin/lld
+
+          Debug server:
+          bin/lldb-server
+
+          Sysroot:
+          sysroot/
+
+          Example C++23 invocation:
+          bin/clang++ --target=aarch64-linux-android${ANDROID_API} \
+            --sysroot=sysroot -stdlib=libc++ -std=c++23 -fuse-ld=lld source.cpp
+
+          Runtime note:
+          Keep lib/ and sysroot/usr/lib/aarch64-linux-android/ available
+          to the launched tools. Configure LD_LIBRARY_PATH in the IDE process
+          if the Android dynamic linker does not resolve the packaged libraries
+          through the installed RUNPATH.
+
+          Build-test note:
+          The packaged compiler binaries are Android AArch64 ELF files, so they
+          cannot be executed directly on the x86_64 GitHub runner. The workflow
+          tests C++23 compilation/linking with the NDK host compiler against
+          this packaged sysroot and validates the packaged binaries' ELF machine.
+
+          Debugging note:
+          lldb-server is provided for Android. The upstream LLDB documentation
+          currently identifies lldb-server, not the lldb command-line client,
+          as the functional Android component.
+          EOF
+
+      # Audits that expected directories, artifacts, and AArch64 ELF headers exist before archiving.
+      - name: Validate installation layout and ARM64 ELF files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          READELF="${NDK_HOME}/toolchains/llvm/prebuilt/${NDK_HOST}/bin/llvm-readelf"
+
+          for dir in bin include lib sysroot; do
+            test -d "${PREFIX}/${dir}"
+          done
+
+          for path in \
+            "${PREFIX}/bin/clang-23" \
+            "${PREFIX}/bin/clang++" \
+            "${PREFIX}/bin/clang-repl" \
+            "${PREFIX}/bin/clangd" \
+            "${PREFIX}/bin/clang-format" \
+            "${PREFIX}/bin/ld.lld" \
+            "${PREFIX}/bin/lld" \
+            "${PREFIX}/bin/lldb-server" \
+            "${PREFIX}/lib/libLLVM.so" \
+            "${PREFIX}/lib/libclang-cpp.so" \
+            "${PREFIX}/lib/clang/23/include" \
+            "${PREFIX}/lib/clang/23/lib/linux/libclang_rt.builtins-aarch64-android.a" \
+            "${PREFIX}/sysroot/usr/include" \
+            "${PREFIX}/sysroot/usr/lib/aarch64-linux-android/${ANDROID_API}"; do
+            test -e "${path}" || {
+              echo "Missing required item: ${path}"
+              exit 1
+            }
+          done
+
+          for path in \
+            "${PREFIX}/bin/clang-23" \
+            "${PREFIX}/bin/clang++" \
+            "${PREFIX}/bin/clang-repl" \
+            "${PREFIX}/bin/clangd" \
+            "${PREFIX}/bin/clang-format" \
+            "${PREFIX}/bin/ld.lld" \
+            "${PREFIX}/bin/lld" \
+            "${PREFIX}/bin/lldb-server" \
+            "${PREFIX}/lib/libLLVM.so" \
+            "${PREFIX}/lib/libclang-cpp.so"; do
+            "${READELF}" -h "${path}" | grep -q 'Machine:.*AArch64' || {
+              echo "Unexpected ELF architecture: ${path}"
+              "${READELF}" -h "${path}" || true
+              exit 1
+            }
+          done
+
+          echo '--- bin ---'
+          find "${PREFIX}/bin" -maxdepth 1 -printf '%y %f -> %l\n' | sort
+          echo '--- lib ---'
+          find "${PREFIX}/lib" -maxdepth 2 -printf '%y %p -> %l\n' | sort
+          echo '--- package sizes ---'
+          du -sh \
+            "${PREFIX}/bin" \
+            "${PREFIX}/include" \
+            "${PREFIX}/lib" \
+            "${PREFIX}/sysroot"
+
+      # Cleans up build temporaries, validates available memory, produces a reproducible .tar.xz
+      # tarball while bounding XZ RAM usage, and generates its SHA-256 checksum file.
+      - name: Package full toolchain using 90% of available memory for XZ
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf "${BUILD_ROOT}" llvm-project
+          cd "${PREFIX}"
+
+          # Reads available memory from Linux /proc/meminfo (in KiB) and fails early if unavailable.
+          AVAIL_MEM_KB=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
+          if [[ -z "${AVAIL_MEM_KB}" ]]; then
+            echo "Error: could not read MemAvailable from /proc/meminfo." >&2
+            exit 1
+          fi
+
+          # Calculates 90% of available memory in MiB to leave headroom for the OS and runner processes,
+          # and aborts if the computed limit is below 256 MiB.
+          XZ_MEM_LIMIT_MB=$(( AVAIL_MEM_KB * 90 / 100 / 1024 ))
+          if (( XZ_MEM_LIMIT_MB < 256 )); then
+            echo "Error: computed XZ memory limit (${XZ_MEM_LIMIT_MB} MiB) is below the 256 MiB minimum; aborting to avoid OOM failures." >&2
+            exit 1
+          fi
+
+          echo "Available memory: $(( AVAIL_MEM_KB / 1024 )) MiB"
+          echo "XZ memory limit: ${XZ_MEM_LIMIT_MB} MiB"
+
+          ARCHIVE_NAME="finalpackage-arm64-ndk-r30-llvm-23.1.6-api-${ANDROID_API}.tar.xz"
+
+          XZ_OPT="-9e -T0 --memlimit=${XZ_MEM_LIMIT_MB}MiB" tar \
+            --sort=name \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            -cJf "${GITHUB_WORKSPACE}/${ARCHIVE_NAME}" \
+            bin include lib sysroot TOOLCHAIN-INFO.txt
+
+          # Generates the .sha256 checksum from the workspace directory so the recorded filename
+          # has no runner-specific path prefix.
+          cd "${GITHUB_WORKSPACE}"
+          sha256sum "${ARCHIVE_NAME}" > "${ARCHIVE_NAME}.sha256"
+          cat "${ARCHIVE_NAME}.sha256"
+
+          ls -lh "${ARCHIVE_NAME}" "${ARCHIVE_NAME}.sha256"
+          tar -tJf "${ARCHIVE_NAME}" \
+            | cut -d/ -f1 \
+            | sort -u
+
+      # Uploads both the raw .tar.xz archive and its .sha256 checksum directly without wrapping in a .zip file.
+      - name: Upload full Android ARM64 toolchain artifact
+        uses: actions/upload-artifact@v7
+        with:
+          path: |
+            finalpackage-arm64-ndk-r30-llvm-23.1.6-api-${{ inputs.android_api }}.tar.xz
+            finalpackage-arm64-ndk-r30-llvm-23.1.6-api-${{ inputs.android_api }}.tar.xz.sha256
+          archive: false
+          if-no-files-found: error
+          retention-days: 31
+
+      # Validates archive and checksum files, replaces any existing API-specific release or orphan tag,
+      # and publishes a standard GitHub Release containing the .tar.xz archive and its .sha256 checksum file.
+      - name: Publish or replace API-specific GitHub Release
+        env:
+          # Uses the workflow's built-in token; ensure the job sets `permissions: contents: write`
+          # so `gh release` and tag cleanup API calls have sufficient access.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          # Fail fast on any command error (-e), unset variable (-u), or failed pipeline stage (-o pipefail).
+          set -euo pipefail
+
+          # Ensure required build metadata is provided before constructing paths or publishing.
+          : "${ANDROID_API:?Error: ANDROID_API is not set}"
+          : "${LLVM_TAG:?Error: LLVM_TAG is not set}"
+          : "${NDK_VERSION:?Error: NDK_VERSION is not set}"
+
+          # Build a unique tag and asset names per Android API level.
+          # Note: `llvm-23.1.6` and `ndk-r30` are hardcoded in these names; update them here if changing
+          # the release naming scheme alongside LLVM_TAG and NDK_VERSION.
+          TAG="llvm-23.1.6-ndk-r30-api-${ANDROID_API}"
+          ARCHIVE_NAME="finalpackage-arm64-ndk-r30-llvm-23.1.6-api-${ANDROID_API}.tar.xz"
+          CHECKSUM_NAME="${ARCHIVE_NAME}.sha256"
+          ARCHIVE_PATH="${GITHUB_WORKSPACE}/${ARCHIVE_NAME}"
+          CHECKSUM_PATH="${GITHUB_WORKSPACE}/${CHECKSUM_NAME}"
+
+          # Verify both the archive and its checksum file exist and are non-empty before uploading.
+          test -s "${ARCHIVE_PATH}" || {
+            echo "Error: archive missing or empty: ${ARCHIVE_PATH}" >&2
+            exit 1
+          }
+          test -s "${CHECKSUM_PATH}" || {
+            echo "Error: checksum file missing or empty: ${CHECKSUM_PATH}" >&2
+            exit 1
+          }
+
+          # Extract the first whitespace-separated token as the expected SHA-256 digest and confirm it is 64 hex chars.
+          SHA256_VALUE=$(awk '{print $1}' "${CHECKSUM_PATH}")
+          if [[ ! "${SHA256_VALUE}" =~ ^[0-9a-fA-F]{64}$ ]]; then
+            echo "Error: invalid SHA-256 digest in ${CHECKSUM_PATH}: '${SHA256_VALUE}'" >&2
+            exit 1
+          fi
+
+          # Compute the actual SHA-256 of the archive and compare case-insensitively to prevent publishing corrupt/mismatched builds.
+          ACTUAL_SHA256=$(sha256sum "${ARCHIVE_PATH}" | awk '{print $1}')
+          if [[ "${SHA256_VALUE,,}" != "${ACTUAL_SHA256,,}" ]]; then
+            echo "Error: checksum mismatch for ${ARCHIVE_NAME} (expected ${SHA256_VALUE}, got ${ACTUAL_SHA256})" >&2
+            exit 1
+          fi
+
+          # Make re-runs idempotent for a given API level: delete an existing release (and its tag),
+          # or remove an orphan remote tag left behind by a deleted/failed release.
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release delete "${TAG}" --yes --cleanup-tag
+          elif gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG}"
+          fi
+
+          # Format release notes with toolchain versions, verified SHA-256, and CI provenance;
+          # `sed` strips leading indentation caused by YAML block formatting.
+          NOTES_BODY=$(cat <<EOF | sed 's/^[[:space:]]*//'
+          Automated build of the Android ARM64 toolchain.
+          - **LLVM:** ${LLVM_TAG}
+          - **NDK:** ${NDK_VERSION}
+          - **Android API:** ${ANDROID_API}
+          - **SHA-256:** \`${SHA256_VALUE}\`
+          - **Commit:** ${GITHUB_SHA}
+          - **Run:** ${GITHUB_RUN_ID} (Build #${GITHUB_RUN_NUMBER})
+          EOF
+          )
+
+          # Create the GitHub Release and attach both the compressed toolchain archive and its checksum file.
+          gh release create "${TAG}" \
+            "${ARCHIVE_PATH}" \
+            "${CHECKSUM_PATH}" \
+            --title "Android ARM64 Toolchain (API ${ANDROID_API})" \
+            --notes "${NOTES_BODY}"
